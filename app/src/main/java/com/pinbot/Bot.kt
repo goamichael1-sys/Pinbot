@@ -16,15 +16,15 @@ object Bot {
 
 object Defaults {
     val map = linkedMapOf(
-        "cx" to 50f,         // coin centre X, % of width (auto-calibrated)
-        "cy" to 46.8f,       // coin centre Y, % of height (auto-calibrated)
-        "r" to 27f,          // coin radius, % of width (auto-calibrated)
-        "latency" to 180f,   // starting guess: ms from tap to pin landing (auto-learned)
-        "margin" to 4.0f,    // required safety gap half-width in degrees (4.0° = 8.0° full gap, fits 40 pins)
-        "minDelay" to 450f,  // min ms between shots (fast human pacing)
-        "jitter" to 250f,    // random extra ms added per shot
-        "thr" to 40f,        // pin detect threshold (lower = more sensitive)
-        "tapY" to 78f        // where to tap, % of height (play area below coin)
+        "cx" to 50f,         // coin centre X, % of width
+        "cy" to 45.6f,       // coin centre Y, % of height
+        "r" to 26.8f,        // coin radius, % of width
+        "latency" to 200f,   // starting guess: ms from decision to pin landing (auto-learned)
+        "margin" to 6f,      // required free gap around landing spot, degrees
+        "minDelay" to 3000f, // min ms between shots
+        "jitter" to 800f,    // random extra ms added to each delay
+        "thr" to 45f,        // pin detect threshold
+        "tapY" to 66f        // where to tap, % of height
     )
 }
 
