@@ -51,8 +51,8 @@ class BotService : Service() {
     private var wasRunning = false
     private var lastTap = 0L
     private var lastStartTap = 0L
-    private var nextDelay = 1500.0
-    private var effLat = -1.0
+    private var nextDelay = 400.0
+    private var effLat = 180.0
     private var lastCfgLat = -1.0
     private var okFrames = 0
     private var unverified = 0
@@ -147,7 +147,7 @@ class BotService : Service() {
         watching = false
         okFrames = 0
         lastTap = now
-        nextDelay = 1500.0
+        nextDelay = 400.0
     }
 
     private fun process(img: Image, w: Int, h: Int) {
@@ -160,9 +160,12 @@ class BotService : Service() {
         val plane = img.planes[0]
         val buf = plane.buffer
         val rs = plane.rowStride
-        val cx = w * c.cx / 100.0
-        val cy = h * c.cy / 100.0
-        val R = w * c.r / 100.0
+
+        // Auto-calibrate coin center and radius from gold coin
+        det.calibrate(buf, rs, w, h, w * c.cx / 100.0, h * c.cy / 100.0, w * c.r / 100.0)
+        val cx = det.calibCx
+        val cy = det.calibCy
+        val R = det.calibR
 
         if (Bot.debugRequest) { Bot.debugRequest = false; saveDebug(buf, rs, w, h, cx, cy, R, c) }
 
@@ -178,8 +181,8 @@ class BotService : Service() {
             resetState(now)
             if (det.startButton(buf, rs, w, h) && now - lastStartTap > 2500) {
                 lastStartTap = now
-                val jx = (rnd.nextDouble() - 0.5) * 0.06
-                if (tapAt(0.5 + jx, 0.73, 40L + rnd.nextInt(40))) Bot.status = "tapped 'Tap to play'"
+                val jx = (rnd.nextDouble() - 0.5) * 0.04
+                if (tapAt(0.5 + jx, 0.73, 40L + rnd.nextInt(30))) Bot.status = "tapped 'Tap to play'"
             } else if (now - lastStartTap > 2500) {
                 Bot.status = "waiting - not on the game screen"
             }
@@ -193,18 +196,17 @@ class BotService : Service() {
         det.update(ft, occ)
 
         val since = now - lastTap
-        val clr = det.clearance(occ, effLat)
-        val need = c.hw + abs(det.omega / 2.0) * 0.05
+        val decision = det.evaluateShot(occ, effLat, c.hw)
         val pins = det.pinBins(occ)
-        val estOk = pins < 6 || (det.stable() && ft - det.lastGoodMs < 600)
-        val good = clr >= need && estOk
+        val speedOk = pins < 4 || (det.stable() && ft - det.lastGoodMs < 700)
+        val good = decision.canShoot && speedOk
         okFrames = if (good) okFrames + 1 else 0
 
-        val patient = since > nextDelay + 20000 && clr >= need  // fallback if speed never looks stable
-        if (since >= nextDelay && (okFrames >= 2 || patient)) {
-            val jx = (rnd.nextDouble() - 0.5) * 0.08
-            val jy = (rnd.nextDouble() - 0.5) * 0.04
-            if (tapAt(0.5 + jx, c.tapY / 100.0 + jy, 35L + rnd.nextInt(45))) {
+        // In tight games, shoot cleanly as soon as cooldown elapsed and alignment is verified
+        if (since >= nextDelay && (okFrames >= 2 || (decision.canShoot && since > nextDelay + 800))) {
+            val jx = (rnd.nextDouble() - 0.5) * 0.03
+            val jy = (rnd.nextDouble() - 0.5) * 0.02
+            if (tapAt(0.5 + jx, c.tapY / 100.0 + jy, 30L + rnd.nextInt(35))) {
                 lastTap = now
                 Bot.fired++
                 nextDelay = c.minDelay + rnd.nextDouble() * c.jitter
@@ -218,41 +220,46 @@ class BotService : Service() {
             return
         }
 
-        val info = "speed %.0f deg/s  lat %.0f ms  shots %d/%d".format(det.omega / 2.0, effLat, Bot.landed, Bot.fired)
+        val info = "speed %.0f°/s | lat %.0fms | shots %d/%d".format(det.omega / 2.0, effLat, Bot.landed, Bot.fired)
         Bot.status = if (since < nextDelay)
             "next shot in %.1fs | %s".format((nextDelay - since) / 1000.0, info)
         else
-            "waiting for a safe gap (%.0f deg, need %.0f%s) | %s".format(clr, need, if (estOk) "" else ", speed unsure", info)
+            "gap: %.1f° (clr: %.1f°) %s | %s".format(decision.gapWidthDeg, decision.clearanceDeg, if (speedOk) "" else "[speed unsure]", info)
     }
 
-    /** After firing: look for the new pin near the landing slot, learn the real latency. */
+    /** After firing: watch for the new pin near the landing slot, learn the real latency. */
     private fun watchLanding(occ: BooleanArray, now: Long) {
         val el = now - tTap
         val pre = preOcc ?: run { watching = false; return }
         val shift = (preOmega * el / 1000.0).roundToInt()
         var cnt = 0
-        for (j in Detector.DOWN - 24..Detector.DOWN + 24) {
+        for (j in Detector.DOWN - 20..Detector.DOWN + 20) {
             if (!occ[wb(j)]) continue
             var expected = false
             for (d in -6..6) if (pre[wb(j - shift + d)]) { expected = true; break }
             if (!expected) cnt++
         }
-        if (el > 50 && cnt >= 4) { if (hitFrames == 0) firstHit = now; hitFrames++ } else hitFrames = 0
+        if (el > 40 && cnt >= 3) {
+            if (hitFrames == 0) firstHit = now
+            hitFrames++
+        } else {
+            hitFrames = 0
+        }
 
         if (hitFrames >= 2) {
-            val meas = (firstHit - tTap) + 15.0
-            if (meas in 80.0..700.0) effLat = 0.6 * effLat + 0.4 * meas
+            val meas = (firstHit - tTap) + 10.0
+            if (meas in 80.0..600.0) effLat = 0.65 * effLat + 0.35 * meas
             Bot.landed++
             unverified = 0
             watching = false
             det.clearHistory()
-        } else if (el > 900) {
+        } else if (el > 800) {
             watching = false
             unverified++
             det.clearHistory()
             if (unverified >= 3) {
                 Bot.running = false
-                Bot.status = "paused: 3 shots in a row not seen landing"
+                Bot.status = "paused: 3 shots not verified landing"
                 TapService.instance?.sync()
             }
         }
@@ -269,16 +276,30 @@ class BotService : Service() {
         bmp.setPixels(px, 0, w, 0, 0, w, h)
         val cv = Canvas(bmp)
         val p = Paint().apply { style = Paint.Style.STROKE; strokeWidth = 2f; isAntiAlias = true }
+        
+        // Green coin edge
         p.color = Color.GREEN; cv.drawCircle(cx.toFloat(), cy.toFloat(), R.toFloat(), p)
-        p.color = Color.BLUE
-        for (k in doubleArrayOf(1.12, 1.36)) cv.drawCircle(cx.toFloat(), cy.toFloat(), (R * k).toFloat(), p)
+        
+        // Center point
+        p.style = Paint.Style.FILL; p.color = Color.RED
+        cv.drawCircle(cx.toFloat(), cy.toFloat(), 4f, p)
+
+        // Multi-tier radii in blue
+        p.style = Paint.Style.STROKE; p.color = Color.BLUE
+        for (k in det.radii) cv.drawCircle(cx.toFloat(), cy.toFloat(), (R * k).toFloat(), p)
+        
+        // Reference ring in red
         p.color = Color.RED; cv.drawCircle(cx.toFloat(), cy.toFloat(), (R * det.refR).toFloat(), p)
+
+        // Occupied pins in yellow dots
         val occ = det.profile(buf, rs, w, h, cx, cy, R, c.thr)
         p.style = Paint.Style.FILL; p.color = Color.YELLOW
         for (b in 0 until Detector.BINS) if (occ[b]) {
             val a = Math.toRadians(b * 360.0 / Detector.BINS)
-            cv.drawCircle((cx + 1.24 * R * cos(a)).toFloat(), (cy + 1.24 * R * sin(a)).toFloat(), 2.5f, p)
+            cv.drawCircle((cx + 1.25 * R * cos(a)).toFloat(), (cy + 1.25 * R * sin(a)).toFloat(), 2.5f, p)
         }
+
+        // 6 o'clock landing slot with margin lines
         p.style = Paint.Style.STROKE; p.color = Color.WHITE; p.strokeWidth = 3f
         for (sgn in intArrayOf(-1, 1)) {
             val a = Math.toRadians(90.0 + sgn * c.hw)
@@ -287,8 +308,10 @@ class BotService : Service() {
                 (cx + 1.62 * R * cos(a)).toFloat(), (cy + 1.62 * R * sin(a)).toFloat(), p
             )
         }
+
         val tp = Paint().apply { color = Color.BLACK; textSize = 22f }
-        cv.drawText("speed=" + (det.omega / 2.0).roundToInt() + " deg/s  lat=" + effLat.roundToInt() + " ms", 10f, 30f, tp)
+        cv.drawText("speed=" + (det.omega / 2.0).roundToInt() + "°/s  lat=" + effLat.roundToInt() + "ms  margin=" + c.hw + "°", 10f, 30f, tp)
+        
         val cvv = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, "pinbot_debug_" + System.currentTimeMillis() + ".png")
             put(MediaStore.Images.Media.MIME_TYPE, "image/png")
