@@ -51,15 +51,10 @@ class Detector {
         return abs(chroma(p) - chroma(ref)) > cthr
     }
 
-    /** Returns true if pixel colour looks like a stuck-pin arrow (pinkish/magenta). */
-    private fun pinColor(c: Int): Boolean {
-        val r = (c shr 16) and 255; val g = (c shr 8) and 255; val b = c and 255
-        return (r + b) - 2 * g > 60 && r > 100  // magenta / pink signature
-    }
-
     /** Occupancy of the pin ring. A bin counts only if >=2 of 3 radii differ from the background
-     *  ring AND at least one sampled pixel has a pin-like (magenta/pink) colour, and only runs
-     *  >= 5 bins wide (~2.5 deg) survive (kills coin notch, confetti and sparkles). */
+     *  ring AND the differing pixels are not gold-coloured (coin body / notch is gold or white,
+     *  pins are pink/grey), and only runs >= 5 bins wide (~2.5 deg) survive (kills coin notch,
+     *  confetti and sparkles). */
     fun profile(buf: ByteBuffer, rs: Int, w: Int, h: Int, cx: Double, cy: Double, R: Double, thr: Int): BooleanArray {
         val raw = BooleanArray(BINS)
         val cthr = thr * 0.36
@@ -70,15 +65,15 @@ class Detector {
             // skip bins where the reference ring pixel is gold-coloured (inside the coin body)
             if (gold(ref)) continue
             var hits = 0
-            var hasPinColor = false
+            var allGold = true   // if every differing pixel is gold, it's the coin notch
             for (k in radii) {
                 val p = px(buf, rs, w, h, cx + k * R * ca, cy + k * R * sa)
                 if (p >= 0 && differs(p, ref, thr, cthr)) {
                     hits++
-                    if (pinColor(p)) hasPinColor = true
+                    if (!gold(p)) allGold = false
                 }
             }
-            raw[b] = hits >= 2 && hasPinColor
+            raw[b] = hits >= 2 && !allGold
         }
         // run-length filter (circular) — min 5 bins to suppress coin notch / small particles
         val out = BooleanArray(BINS)
