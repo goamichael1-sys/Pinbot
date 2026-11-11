@@ -7,6 +7,8 @@ import android.graphics.Color
 import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.WindowManager
@@ -20,29 +22,40 @@ class TapService : AccessibilityService() {
 
     private var wm: WindowManager? = null
     private var btn: TextView? = null
+    private val main = Handler(Looper.getMainLooper())
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
     override fun onInterrupt() {}
 
-    override fun onServiceConnected() {
-        instance = this
-        addButton()
-    }
+    override fun onServiceConnected() { instance = this }
 
     override fun onUnbind(intent: Intent?): Boolean {
         instance = null
-        try { btn?.let { wm?.removeView(it) } } catch (_: Throwable) {}
-        btn = null
+        hideButton()
         return super.onUnbind(intent)
     }
 
-    fun tap(x: Float, y: Float) {
+    /** Taps only work while the master switch (capture) is ON. */
+    fun tap(x: Float, y: Float, durMs: Long = 40) {
+        if (!Bot.capturing) return
         val p = Path().apply { moveTo(x, y) }
         val g = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(p, 0, 25))
+            .addStroke(GestureDescription.StrokeDescription(p, 0, durMs))
             .build()
         dispatchGesture(g, null, null)
     }
+
+    fun showButton() = main.post {
+        if (btn == null) addButton()
+        btn?.let { paint(it, Bot.running) }
+    }
+
+    fun hideButton() = main.post {
+        try { btn?.let { wm?.removeView(it) } } catch (_: Throwable) {}
+        btn = null
+    }
+
+    fun sync() = main.post { btn?.let { paint(it, Bot.running) } }
 
     private fun paint(tv: TextView, on: Boolean) {
         tv.text = if (on) "■" else "▶"
@@ -56,7 +69,7 @@ class TapService : AccessibilityService() {
         if (!Bot.capturing) {
             Bot.running = false
             paint(tv, false)
-            Toast.makeText(this, "Start capture in the PinBot app first", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Switch the bot ON in the PinBot app first", Toast.LENGTH_SHORT).show()
             return
         }
         Bot.running = !Bot.running

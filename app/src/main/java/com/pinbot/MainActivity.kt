@@ -14,20 +14,25 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 
 class MainActivity : Activity() {
     private lateinit var status: TextView
+    private lateinit var sw: Switch
+    private var suppress = false
+    private var startRequested = 0L
     private val ui = Handler(Looper.getMainLooper())
     private val fields = LinkedHashMap<String, EditText>()
     private val labels = mapOf(
         "cx" to "Coin centre X (% of screen width)",
         "cy" to "Coin centre Y (% of screen height)",
         "r" to "Coin radius (% of screen width)",
-        "latency" to "Tap-to-landing latency (ms)",
-        "hw" to "Safety half-width (degrees)",
-        "cooldown" to "Min time between shots (ms)",
+        "latency" to "Starting latency guess, tap to landing (ms, auto-learned)",
+        "margin" to "Required free gap around landing spot (degrees, bigger = safer)",
+        "minDelay" to "Minimum delay between shots (ms)",
+        "jitter" to "Random extra delay added per shot (ms)",
         "thr" to "Pin detect threshold (lower = more sensitive)",
         "tapY" to "Tap position Y (% of screen height)"
     )
@@ -36,6 +41,14 @@ class MainActivity : Activity() {
         text = t
         setOnClickListener { f() }
     }
+
+    private fun applySettings() {
+        val ed = Bot.prefs(this).edit()
+        for ((k, e) in fields) e.text.toString().toFloatOrNull()?.let { ed.putFloat(k, it) }
+        ed.apply()
+    }
+
+    private fun setSwitch(on: Boolean) { suppress = true; sw.isChecked = on; suppress = false }
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
@@ -48,16 +61,34 @@ class MainActivity : Activity() {
         status = TextView(this).apply { textSize = 14f; setPadding(0, 20, 0, 20) }
         root.addView(status)
 
-        root.addView(button("1. Enable accessibility service") {
+        root.addView(button("Step 1: enable accessibility service (once)") {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         })
-        root.addView(button("2. Start screen capture") {
-            val mpm = getSystemService(MediaProjectionManager::class.java)
-            startActivityForResult(mpm.createScreenCaptureIntent(), 42)
-        })
-        root.addView(button("Stop capture") {
-            startService(Intent(this, BotService::class.java).setAction("stop"))
-        })
+
+        sw = Switch(this).apply {
+            text = "Bot ON / OFF (nothing runs while OFF)"
+            textSize = 18f
+            setPadding(0, 30, 0, 30)
+        }
+        sw.setOnCheckedChangeListener { _, on ->
+            if (suppress) return@setOnCheckedChangeListener
+            if (on) {
+                if (TapService.instance == null) {
+                    Toast.makeText(this, "Enable the accessibility service first", Toast.LENGTH_LONG).show()
+                    startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                    setSwitch(false)
+                } else {
+                    applySettings()
+                    startRequested = System.currentTimeMillis()
+                    val mpm = getSystemService(MediaProjectionManager::class.java)
+                    startActivityForResult(mpm.createScreenCaptureIntent(), 42)
+                }
+            } else {
+                stopService(Intent(this, BotService::class.java))
+            }
+        }
+        root.addView(sw)
+
         root.addView(button("Save debug screenshot (Pictures/PinBot)") { Bot.debugRequest = true })
 
         root.addView(TextView(this).apply { text = "\nSettings"; textSize = 18f })
@@ -71,9 +102,7 @@ class MainActivity : Activity() {
             root.addView(e)
         }
         root.addView(button("Apply settings") {
-            val ed = Bot.prefs(this).edit()
-            for ((k, e) in fields) e.text.toString().toFloatOrNull()?.let { ed.putFloat(k, it) }
-            ed.apply()
+            applySettings()
             Toast.makeText(this, "Saved", Toast.LENGTH_SHORT).show()
         })
         root.addView(button("Reset to defaults") {
@@ -84,18 +113,23 @@ class MainActivity : Activity() {
 
     override fun onActivityResult(req: Int, res: Int, data: Intent?) {
         super.onActivityResult(req, res, data)
-        if (req == 42 && res == RESULT_OK && data != null) {
+        if (req != 42) return
+        if (res == RESULT_OK && data != null) {
             startForegroundService(
                 Intent(this, BotService::class.java).putExtra("code", res).putExtra("data", data)
             )
+        } else {
+            setSwitch(false)
         }
     }
 
     private val tick = object : Runnable {
         override fun run() {
+            // keep the switch honest (e.g. stopped from the notification)
+            if (sw.isChecked != Bot.capturing &&
+                (!sw.isChecked || System.currentTimeMillis() - startRequested > 8000)) setSwitch(Bot.capturing)
             status.text = "Accessibility: " + (if (TapService.instance != null) "ON" else "OFF") +
-                    "\nCapture: " + (if (Bot.capturing) "ON" else "OFF") +
-                    "\nBot: " + (if (Bot.running) "RUNNING" else "paused") +
+                    "\nBot: " + (if (!Bot.capturing) "OFF" else if (Bot.running) "RUNNING" else "ON, paused") +
                     "\n" + Bot.status
             ui.postDelayed(this, 500)
         }

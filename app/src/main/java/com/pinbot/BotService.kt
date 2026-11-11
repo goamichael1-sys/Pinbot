@@ -28,7 +28,10 @@ import android.os.SystemClock
 import android.provider.MediaStore
 import android.view.WindowManager
 import java.nio.ByteBuffer
+import java.util.Random
+import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.roundToInt
 import kotlin.math.sin
 
 class BotService : Service() {
@@ -37,12 +40,30 @@ class BotService : Service() {
     private var reader: ImageReader? = null
     private var thread: HandlerThread? = null
     private val det = Detector()
-    private var lastTap = 0L
-    private var lastStartTap = 0L
+    private val rnd = Random()
+
     private var fullW = 0
     private var fullH = 0
     private var cfg: Cfg? = null
     private var cfgAt = 0L
+
+    // shooting state
+    private var wasRunning = false
+    private var lastTap = 0L
+    private var lastStartTap = 0L
+    private var nextDelay = 1500.0
+    private var effLat = -1.0
+    private var lastCfgLat = -1.0
+    private var okFrames = 0
+    private var unverified = 0
+
+    // landing watch
+    private var watching = false
+    private var tTap = 0L
+    private var preOcc: BooleanArray? = null
+    private var preOmega = 0.0
+    private var hitFrames = 0
+    private var firstHit = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -64,8 +85,8 @@ class BotService : Service() {
             this, 1, Intent(this, BotService::class.java).setAction("stop"), PendingIntent.FLAG_IMMUTABLE
         )
         val n = Notification.Builder(this, "bot")
-            .setContentTitle("PinBot capture active")
-            .setContentText("Use the floating button to run / pause")
+            .setContentTitle("PinBot is ON")
+            .setContentText("Floating button = run / pause. Tap Stop to switch off.")
             .setSmallIcon(android.R.drawable.ic_media_play)
             .addAction(
                 Notification.Action.Builder(
@@ -107,19 +128,35 @@ class BotService : Service() {
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, r.surface, null, handler
         )
         Bot.capturing = true
-        Bot.status = "capture on - press the floating button to run"
+        Bot.running = false
+        Bot.fired = 0; Bot.landed = 0
+        Bot.status = "ON - press the floating button to start"
+        TapService.instance?.showButton()
     }
 
-    private fun tapAt(fx: Double, fy: Double): Boolean {
+    private fun tapAt(fx: Double, fy: Double, dur: Long): Boolean {
         val s = TapService.instance ?: run { Bot.status = "accessibility service is OFF"; return false }
-        s.tap((fx * fullW).toFloat(), (fy * fullH).toFloat())
+        s.tap((fx * fullW).toFloat(), (fy * fullH).toFloat(), dur)
         return true
+    }
+
+    private fun wb(j: Int) = ((j % Detector.BINS) + Detector.BINS) % Detector.BINS
+
+    private fun resetState(now: Long) {
+        det.reset()
+        watching = false
+        okFrames = 0
+        lastTap = now
+        nextDelay = 1500.0
     }
 
     private fun process(img: Image, w: Int, h: Int) {
         val now = SystemClock.elapsedRealtime()
+        val ft = if (img.timestamp > 0) img.timestamp / 1_000_000L else now
         if (cfg == null || now - cfgAt > 500) { cfg = loadCfg(Bot.prefs(this)); cfgAt = now }
         val c = cfg!!
+        if (c.latency != lastCfgLat) { effLat = c.latency; lastCfgLat = c.latency }
+
         val plane = img.planes[0]
         val buf = plane.buffer
         val rs = plane.rowStride
@@ -128,28 +165,97 @@ class BotService : Service() {
         val R = w * c.r / 100.0
 
         if (Bot.debugRequest) { Bot.debugRequest = false; saveDebug(buf, rs, w, h, cx, cy, R, c) }
-        if (!Bot.running) { det.reset(); Bot.status = "paused"; return }
+
+        if (!Bot.running) {
+            wasRunning = false
+            resetState(now)
+            if (!Bot.debugStatusHold()) Bot.status = "ON - paused (press the floating button)"
+            return
+        }
+        if (!wasRunning) { wasRunning = true; unverified = 0; Bot.fired = 0; Bot.landed = 0; resetState(now) }
 
         if (!det.playing(buf, rs, w, h, cx, cy, R)) {
-            det.reset()
+            resetState(now)
             if (det.startButton(buf, rs, w, h) && now - lastStartTap > 2500) {
                 lastStartTap = now
-                if (tapAt(0.5, 0.73)) Bot.status = "tapped 'Tap to play'"
+                val jx = (rnd.nextDouble() - 0.5) * 0.06
+                if (tapAt(0.5 + jx, 0.73, 40L + rnd.nextInt(40))) Bot.status = "tapped 'Tap to play'"
             } else if (now - lastStartTap > 2500) {
                 Bot.status = "waiting - not on the game screen"
             }
             return
         }
 
-        // pin is in flight / just landed: don't look at the ring now
-        if (now - lastTap < c.latency + 60) return
-
         val occ = det.profile(buf, rs, w, h, cx, cy, R, c.thr)
-        det.update(now, occ)
-        if (now - lastTap >= c.cooldown && det.clear(occ, c.latency, c.hw)) {
-            if (tapAt(0.5, c.tapY / 100.0)) { lastTap = now; Bot.taps++ }
+
+        if (watching) { watchLanding(occ, now); return }
+
+        det.update(ft, occ)
+
+        val since = now - lastTap
+        val clr = det.clearance(occ, effLat)
+        val need = c.hw + abs(det.omega / 2.0) * 0.05
+        val pins = det.pinBins(occ)
+        val estOk = pins < 6 || (det.stable() && ft - det.lastGoodMs < 600)
+        val good = clr >= need && estOk
+        okFrames = if (good) okFrames + 1 else 0
+
+        val patient = since > nextDelay + 20000 && clr >= need  // fallback if speed never looks stable
+        if (since >= nextDelay && (okFrames >= 2 || patient)) {
+            val jx = (rnd.nextDouble() - 0.5) * 0.08
+            val jy = (rnd.nextDouble() - 0.5) * 0.04
+            if (tapAt(0.5 + jx, c.tapY / 100.0 + jy, 35L + rnd.nextInt(45))) {
+                lastTap = now
+                Bot.fired++
+                nextDelay = c.minDelay + rnd.nextDouble() * c.jitter
+                watching = true
+                tTap = now
+                preOcc = occ.copyOf()
+                preOmega = det.omega
+                hitFrames = 0
+                okFrames = 0
+            }
+            return
         }
-        Bot.status = "RUNNING  speed=%.0f deg/s  shots=%d".format(det.omega / 2.0, Bot.taps)
+
+        val info = "speed %.0f deg/s  lat %.0f ms  shots %d/%d".format(det.omega / 2.0, effLat, Bot.landed, Bot.fired)
+        Bot.status = if (since < nextDelay)
+            "next shot in %.1fs | %s".format((nextDelay - since) / 1000.0, info)
+        else
+            "waiting for a safe gap (%.0f deg, need %.0f%s) | %s".format(clr, need, if (estOk) "" else ", speed unsure", info)
+    }
+
+    /** After firing: look for the new pin near the landing slot, learn the real latency. */
+    private fun watchLanding(occ: BooleanArray, now: Long) {
+        val el = now - tTap
+        val pre = preOcc ?: run { watching = false; return }
+        val shift = (preOmega * el / 1000.0).roundToInt()
+        var cnt = 0
+        for (j in Detector.DOWN - 24..Detector.DOWN + 24) {
+            if (!occ[wb(j)]) continue
+            var expected = false
+            for (d in -6..6) if (pre[wb(j - shift + d)]) { expected = true; break }
+            if (!expected) cnt++
+        }
+        if (el > 50 && cnt >= 4) { if (hitFrames == 0) firstHit = now; hitFrames++ } else hitFrames = 0
+
+        if (hitFrames >= 2) {
+            val meas = (firstHit - tTap) + 15.0
+            if (meas in 80.0..700.0) effLat = 0.6 * effLat + 0.4 * meas
+            Bot.landed++
+            unverified = 0
+            watching = false
+            det.clearHistory()
+        } else if (el > 900) {
+            watching = false
+            unverified++
+            det.clearHistory()
+            if (unverified >= 3) {
+                Bot.running = false
+                Bot.status = "paused: 3 shots in a row not seen landing"
+                TapService.instance?.sync()
+            }
+        }
     }
 
     private fun saveDebug(buf: ByteBuffer, rs: Int, w: Int, h: Int, cx: Double, cy: Double, R: Double, c: Cfg) {
@@ -167,14 +273,12 @@ class BotService : Service() {
         p.color = Color.BLUE
         for (k in doubleArrayOf(1.12, 1.36)) cv.drawCircle(cx.toFloat(), cy.toFloat(), (R * k).toFloat(), p)
         p.color = Color.RED; cv.drawCircle(cx.toFloat(), cy.toFloat(), (R * det.refR).toFloat(), p)
-        // occupied bins
         val occ = det.profile(buf, rs, w, h, cx, cy, R, c.thr)
         p.style = Paint.Style.FILL; p.color = Color.YELLOW
         for (b in 0 until Detector.BINS) if (occ[b]) {
             val a = Math.toRadians(b * 360.0 / Detector.BINS)
             cv.drawCircle((cx + 1.24 * R * cos(a)).toFloat(), (cy + 1.24 * R * sin(a)).toFloat(), 2.5f, p)
         }
-        // landing slot
         p.style = Paint.Style.STROKE; p.color = Color.WHITE; p.strokeWidth = 3f
         for (sgn in intArrayOf(-1, 1)) {
             val a = Math.toRadians(90.0 + sgn * c.hw)
@@ -183,6 +287,8 @@ class BotService : Service() {
                 (cx + 1.62 * R * cos(a)).toFloat(), (cy + 1.62 * R * sin(a)).toFloat(), p
             )
         }
+        val tp = Paint().apply { color = Color.BLACK; textSize = 22f }
+        cv.drawText("speed=" + (det.omega / 2.0).roundToInt() + " deg/s  lat=" + effLat.roundToInt() + " ms", 10f, 30f, tp)
         val cvv = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, "pinbot_debug_" + System.currentTimeMillis() + ".png")
             put(MediaStore.Images.Media.MIME_TYPE, "image/png")
@@ -196,6 +302,8 @@ class BotService : Service() {
     override fun onDestroy() {
         Bot.running = false
         Bot.capturing = false
+        Bot.status = "off"
+        TapService.instance?.hideButton()
         try { vd?.release() } catch (_: Throwable) {}
         try { reader?.close() } catch (_: Throwable) {}
         try { mp?.stop() } catch (_: Throwable) {}
